@@ -462,7 +462,26 @@ Handles rendering of different media types.
 
 ## Bot Detection Logic
 
-Messages are classified as "bot" based on patterns:
+### Smart Bot Detection (New)
+
+Messages are now accurately classified as "bot" or "staff" by comparing with `n8n_chat_histories` database:
+
+```typescript
+// Fetch bot messages from Supabase
+const botMessages = await fetchBotMessages();
+
+// Check if message content matches AI responses in database
+const isBotMessage = checkIfBotMessage(content, phoneNumber, botMessages);
+```
+
+**Classification:**
+- 🤖 **AI Assistant**: Messages matching `type: "ai"` in `n8n_chat_histories`
+- 👤 **Staff**: Outgoing messages NOT in `n8n_chat_histories`
+- 👤 **Patient**: Incoming messages (`fromMe: false`)
+
+### Legacy Pattern Detection (Fallback)
+
+Used when database comparison is not available:
 
 ```typescript
 const botPatterns = [
@@ -478,6 +497,70 @@ const botPatterns = [
   'كيف أقدر أساعدك',
 ];
 ```
+
+---
+
+## Data Sources Integration
+
+The conversation dashboard now integrates data from multiple sources:
+
+### Data Flow
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Conversation Dashboard                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │  Evolution API  │  │ n8n_chat_       │  │ conversation │ │
+│  │  (WhatsApp)     │  │ histories       │  │ _logs        │ │
+│  └────────┬────────┘  └────────┬────────┘  └──────┬───────┘ │
+│           │                    │                   │         │
+│           │    Real-time       │    Bot/Human      │   Bot   │
+│           │    messages +      │    messages       │ messages│
+│           │    media           │    (AI type)      │         │
+│           │                    │                   │         │
+│           └────────────┬───────┴───────────────────┘         │
+│                        │                                      │
+│                        ▼                                      │
+│           ┌────────────────────────┐                         │
+│           │   Merged & Deduplicated │                         │
+│           │   Conversation Data     │                         │
+│           └────────────────────────┘                         │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Source Details
+
+| Source | Data Type | Purpose |
+|--------|-----------|---------|
+| **Evolution API** | Real-time messages | WhatsApp messages with media (images, audio, video, documents) |
+| **n8n_chat_histories** | AI/Human messages | Bot conversation history, patient messages |
+| **conversation_logs** | Bot questions | Outgoing bot messages with resolution status |
+
+### Key Functions
+
+```typescript
+// Fetch all unique phone numbers from Supabase
+fetchAllConversationNumbers(): Promise<Set<string>>
+
+// Fetch messages from Supabase for a specific phone
+fetchSupabaseMessages(phoneNumber: string): Promise<ChatMessage[]>
+
+// Fetch bot AI messages for comparison
+fetchBotMessages(): Promise<Map<string, Set<string>>>
+
+// Main function - merges all sources
+fetchGroupedConversations(): Promise<GroupedConversation[]>
+```
+
+### LID (Linked ID) Support
+
+Evolution API uses LID format for incoming messages:
+- Outgoing: `remoteJid: "971xxx@s.whatsapp.net"`
+- Incoming: `remoteJid: "xxx@lid"` + `remoteJidAlt: "971xxx@s.whatsapp.net"`
+
+The system handles both formats automatically.
 
 ---
 
@@ -529,4 +612,38 @@ For issues or questions, contact the development team.
 
 ---
 
-*Last Updated: February 2025*
+*Last Updated: February 2, 2026*
+
+---
+
+## Changelog
+
+### v0.1.1 (February 2, 2026)
+
+#### New Features
+- ✅ **Smart Bot Detection**: Messages now accurately classified as AI Assistant vs Staff by comparing with `n8n_chat_histories` database
+- ✅ **Multi-Source Data Integration**: Conversations now merged from Evolution API, `n8n_chat_histories`, and `conversation_logs`
+- ✅ **All Conversations Display**: Removed today-only filter, now shows all historical conversations
+- ✅ **LID Format Support**: Proper handling of Evolution API LID format for incoming messages
+
+#### Bug Fixes
+- 🐛 Fixed patient messages not appearing (LID format issue)
+- 🐛 Fixed all outgoing messages showing as "Staff" instead of "AI Assistant"
+
+#### Technical Changes
+- Added `fetchBotMessages()` for database-based bot detection
+- Added `fetchAllConversationNumbers()` to get all conversation phone numbers
+- Added `fetchSupabaseMessages()` to fetch messages from Supabase
+- Updated `fetchGroupedConversations()` to merge multiple data sources
+- Added `remoteJidAlt` support in `EvolutionMessage` interface
+- Added caching for bot messages (1 minute TTL)
+
+### v0.1.0 (February 1, 2026)
+
+#### Initial Features
+- 📱 WhatsApp-style conversation dashboard
+- 🖼️ Media support (images, audio, video, documents)
+- 🔄 Base64 media fetching from Evolution API
+- 🌐 Bilingual support (Arabic RTL / English LTR)
+- 📊 Patient management and reliability scoring
+- 📅 Appointment scheduling and calendar

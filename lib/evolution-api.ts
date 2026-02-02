@@ -3,8 +3,20 @@
  * For fetching WhatsApp messages from Evolution API
  */
 
+import { createClient } from '@supabase/supabase-js';
+
 const EVOLUTION_API_URL = 'https://evo.pyramedia.info';
 const EVOLUTION_API_KEY = 'D765376E8FF7-4964-A295-BDDA9B2186E9';
+
+// Supabase client for fetching bot messages
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://elitelifedb.pyramedia.cloud';
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Cache for bot messages (to avoid multiple DB calls)
+let botMessagesCache: Map<string, Set<string>> = new Map();
+let cacheTimestamp: number = 0;
+const CACHE_DURATION = 60000; // 1 minute cache
 
 // Message types from Evolution API
 export interface EvolutionMessage {
@@ -12,7 +24,8 @@ export interface EvolutionMessage {
   key: {
     id: string;
     fromMe: boolean;
-    remoteJid: string; // Phone number with @s.whatsapp.net
+    remoteJid: string; // Phone number with @s.whatsapp.net or LID format
+    remoteJidAlt?: string; // Alternative phone number (used when remoteJid is LID)
   };
   pushName: string; // Sender's WhatsApp name
   messageType: string; // 'conversation', 'extendedTextMessage', 'imageMessage', etc.
@@ -107,8 +120,17 @@ export interface GroupedConversation {
 
 /**
  * Extract phone number from WhatsApp JID
+ * Handles both standard format (971xxx@s.whatsapp.net) and LID format (xxx@lid)
  */
-export function extractPhoneNumber(jid: string): string {
+export function extractPhoneNumber(jid: string, altJid?: string): string {
+  // If this is a LID format and we have an alternative JID, use that
+  if (jid.includes('@lid') && altJid) {
+    return altJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+  }
+  // Handle LID format without alternative (shouldn't happen but just in case)
+  if (jid.includes('@lid')) {
+    return jid.replace('@lid', '');
+  }
   return jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
 }
 
@@ -201,9 +223,263 @@ export function getMessageStatus(updates?: { status: string }[]): string {
 }
 
 /**
- * Detect if message is from bot/automated system
+ * Fetch bot (AI) messages from n8n_chat_histories
+ * Returns a Map of session_id -> Set of message contents
  */
-export function isFromBot(message: EvolutionMessage): boolean {
+export async function fetchBotMessages(): Promise<Map<string, Set<string>>> {
+  // Check cache
+  if (Date.now() - cacheTimestamp < CACHE_DURATION && botMessagesCache.size > 0) {
+    return botMessagesCache;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('n8n_chat_histories')
+      .select('session_id, message')
+      .order('created_at', { ascending: false })
+      .limit(1000);
+
+    if (error) {
+      console.error('Error fetching bot messages:', error);
+      return botMessagesCache;
+    }
+
+    const newCache = new Map<string, Set<string>>();
+
+    data?.forEach(row => {
+      // Only AI messages (bot responses)
+      if (row.message?.type === 'ai' && row.message?.content) {
+        const sessionId = row.session_id;
+        const content = normalizeMessageContent(row.message.content);
+
+        if (!newCache.has(sessionId)) {
+          newCache.set(sessionId, new Set());
+        }
+        newCache.get(sessionId)!.add(content);
+      }
+    });
+
+    botMessagesCache = newCache;
+    cacheTimestamp = Date.now();
+
+    return newCache;
+  } catch (error) {
+    console.error('Error in fetchBotMessages:', error);
+    return botMessagesCache;
+  }
+}
+
+/**
+ * Normalize message content for comparison
+ */
+function normalizeMessageContent(content: string): string {
+  return content
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .substring(0, 100); // First 100 chars for comparison
+}
+
+/**
+ * Check if message content matches bot messages from n8n_chat_histories
+ */
+export function checkIfBotMessage(
+  content: string,
+  sessionId: string,
+  botMessages: Map<string, Set<string>>
+): boolean {
+  const normalizedContent = normalizeMessageContent(content);
+  const sessionBotMessages = botMessages.get(sessionId);
+
+  if (!sessionBotMessages) return false;
+
+  // Check if any bot message starts with the same content
+  for (const botContent of sessionBotMessages) {
+    if (botContent.startsWith(normalizedContent) || normalizedContent.startsWith(botContent)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Conversation log from Supabase
+ */
+interface ConversationLog {
+  id: string;
+  whatsapp_number: string;
+  patient_id: string | null;
+  message_type: 'incoming' | 'outgoing';
+  message_content: string;
+  source_instance: string;
+  created_at: string;
+  is_bot_question: boolean;
+  question_type: string;
+  resolved: boolean;
+}
+
+/**
+ * N8N Chat History message
+ */
+interface N8NChatHistory {
+  id: number;
+  session_id: string;
+  message: {
+    type: 'ai' | 'human' | 'tool';
+    content: string;
+  };
+  created_at: string;
+}
+
+/**
+ * Get all unique conversation phone numbers from Supabase
+ * This includes conversations that might not be in today's Evolution API data
+ */
+export async function fetchAllConversationNumbers(): Promise<Set<string>> {
+  const phoneNumbers = new Set<string>();
+
+  try {
+    // Fetch from n8n_chat_histories
+    const { data: chatHistories, error: chatError } = await supabase
+      .from('n8n_chat_histories')
+      .select('session_id')
+      .order('created_at', { ascending: false });
+
+    if (!chatError && chatHistories) {
+      chatHistories.forEach(row => {
+        if (row.session_id) {
+          phoneNumbers.add(row.session_id);
+        }
+      });
+    }
+
+    // Fetch from conversation_logs
+    const { data: convLogs, error: convError } = await supabase
+      .from('conversation_logs')
+      .select('whatsapp_number')
+      .order('created_at', { ascending: false });
+
+    if (!convError && convLogs) {
+      convLogs.forEach(row => {
+        if (row.whatsapp_number) {
+          phoneNumbers.add(row.whatsapp_number);
+        }
+      });
+    }
+
+    console.log(`Found ${phoneNumbers.size} unique conversation numbers from Supabase`);
+    return phoneNumbers;
+  } catch (error) {
+    console.error('Error fetching conversation numbers:', error);
+    return phoneNumbers;
+  }
+}
+
+/**
+ * Fetch conversation messages from Supabase for a specific phone number
+ * Combines data from n8n_chat_histories and conversation_logs
+ */
+export async function fetchSupabaseMessages(phoneNumber: string): Promise<ChatMessage[]> {
+  const messages: ChatMessage[] = [];
+
+  try {
+    // Fetch from n8n_chat_histories
+    const { data: chatHistories, error: chatError } = await supabase
+      .from('n8n_chat_histories')
+      .select('*')
+      .eq('session_id', phoneNumber)
+      .order('created_at', { ascending: true });
+
+    if (!chatError && chatHistories) {
+      chatHistories.forEach((row: N8NChatHistory) => {
+        if (row.message?.content && row.message.type !== 'tool') {
+          const isAI = row.message.type === 'ai';
+          const isHuman = row.message.type === 'human';
+
+          // Extract actual user message from human type (remove metadata)
+          let content = row.message.content;
+          if (isHuman && content.includes('User Message:')) {
+            // Extract message between "User Message:" and "---" or end of string
+            const startIndex = content.indexOf('User Message:') + 'User Message:'.length;
+            const endIndex = content.indexOf('\n---');
+            if (endIndex > startIndex) {
+              content = content.substring(startIndex, endIndex).trim();
+            } else {
+              content = content.substring(startIndex).trim();
+            }
+          }
+
+          // Skip tool calls and empty messages
+          if (!content || content.includes('Calling ') || content.startsWith('{')) {
+            return;
+          }
+
+          messages.push({
+            id: `n8n-${row.id}`,
+            message_key_id: `n8n-${row.id}`,
+            whatsapp_number: phoneNumber,
+            sender_name: isHuman ? phoneNumber : 'AI Assistant',
+            message_type: isAI ? 'outgoing' : 'incoming',
+            message_content: content,
+            message_media_type: 'text',
+            timestamp: new Date(row.created_at).getTime(),
+            created_at: row.created_at,
+            status: 'read',
+            is_from_bot: isAI,
+          });
+        }
+      });
+    }
+
+    // Fetch from conversation_logs (these are bot outgoing messages)
+    const { data: convLogs, error: convError } = await supabase
+      .from('conversation_logs')
+      .select('*')
+      .eq('whatsapp_number', phoneNumber)
+      .order('created_at', { ascending: true });
+
+    if (!convError && convLogs) {
+      convLogs.forEach((row: ConversationLog) => {
+        // Check if this message already exists (avoid duplicates)
+        const exists = messages.some(m =>
+          normalizeMessageContent(m.message_content) === normalizeMessageContent(row.message_content) &&
+          Math.abs(new Date(m.created_at).getTime() - new Date(row.created_at).getTime()) < 60000 // Within 1 minute
+        );
+
+        if (!exists && row.message_content) {
+          messages.push({
+            id: `conv-${row.id}`,
+            message_key_id: `conv-${row.id}`,
+            whatsapp_number: phoneNumber,
+            sender_name: row.message_type === 'incoming' ? phoneNumber : 'AI Assistant',
+            message_type: row.message_type,
+            message_content: row.message_content,
+            message_media_type: 'text',
+            timestamp: new Date(row.created_at).getTime(),
+            created_at: row.created_at,
+            status: row.resolved ? 'read' : 'delivered',
+            is_from_bot: row.is_bot_question,
+          });
+        }
+      });
+    }
+
+    // Sort by timestamp
+    messages.sort((a, b) => a.timestamp - b.timestamp);
+
+    return messages;
+  } catch (error) {
+    console.error('Error fetching Supabase messages:', error);
+    return messages;
+  }
+}
+
+/**
+ * Detect if message is from bot/automated system (legacy - pattern based)
+ * This is used as fallback when we can't check against database
+ */
+export function isFromBotPattern(message: EvolutionMessage): boolean {
   // Safety check
   if (!message || !message.key) return false;
 
@@ -230,6 +506,18 @@ export function isFromBot(message: EvolutionMessage): boolean {
 }
 
 /**
+ * Detect if message is from bot/automated system
+ * Now just a simple check - actual bot detection happens in fetchGroupedConversations
+ */
+export function isFromBot(message: EvolutionMessage): boolean {
+  // Safety check - incoming messages are never from bot
+  if (!message || !message.key || !message.key.fromMe) return false;
+
+  // Default to pattern-based detection (will be overridden in fetchGroupedConversations)
+  return isFromBotPattern(message);
+}
+
+/**
  * Transform Evolution API message to our ChatMessage format
  */
 export function transformMessage(msg: EvolutionMessage): ChatMessage {
@@ -238,14 +526,18 @@ export function transformMessage(msg: EvolutionMessage): ChatMessage {
   // Safely get timestamp (default to current time if missing)
   const timestamp = (msg.messageTimestamp || Math.floor(Date.now() / 1000)) * 1000;
 
-  // Safely extract remoteJid
+  // Safely extract remoteJid - use remoteJidAlt for LID format messages
   const remoteJid = msg.key?.remoteJid || '';
+  const remoteJidAlt = msg.key?.remoteJidAlt;
+
+  // Get phone number - handles both standard and LID formats
+  const phoneNumber = extractPhoneNumber(remoteJid, remoteJidAlt);
 
   return {
     id: msg.id || `msg-${Date.now()}`,
     message_key_id: msg.key?.id || '',
-    whatsapp_number: extractPhoneNumber(remoteJid),
-    sender_name: msg.pushName || extractPhoneNumber(remoteJid) || 'Unknown',
+    whatsapp_number: phoneNumber,
+    sender_name: msg.pushName || phoneNumber || 'Unknown',
     message_type: msg.key?.fromMe ? 'outgoing' : 'incoming',
     message_content: content,
     message_media_type: mediaType,
@@ -350,18 +642,25 @@ export async function fetchMessages(
 
 /**
  * Fetch all messages and group by conversation
+ * Now includes ALL conversations from Supabase (n8n_chat_histories + conversation_logs)
+ * merged with Evolution API messages
  */
 export async function fetchGroupedConversations(
   instanceName: string = 'elite-shahd',
-  limit: number = 500
+  limit: number = 1000
 ): Promise<GroupedConversation[]> {
   try {
-    // Fetch messages
-    const { messages: rawMessages } = await fetchMessages(instanceName, { limit });
+    // Fetch Evolution API messages, bot messages, and all conversation numbers in parallel
+    const [{ messages: rawMessages }, botMessages, allConversationNumbers] = await Promise.all([
+      fetchMessages(instanceName, { limit }),
+      fetchBotMessages(),
+      fetchAllConversationNumbers()
+    ]);
 
-    // Transform and group messages
+    // Transform and group Evolution API messages
     const messagesMap = new Map<string, ChatMessage[]>();
     const contactNames = new Map<string, string>();
+    const processedPhones = new Set<string>();
 
     rawMessages.forEach(msg => {
       // Skip invalid messages (missing key or remoteJid)
@@ -370,8 +669,14 @@ export async function fetchGroupedConversations(
         return;
       }
 
-      // Skip group messages
+      // Skip group messages (but not LID messages which are individual chats)
       if (msg.key.remoteJid.includes('@g.us')) return;
+
+      // For LID messages, ensure we have remoteJidAlt to get the real phone number
+      if (msg.key.remoteJid.includes('@lid') && !msg.key.remoteJidAlt) {
+        console.warn('Skipping LID message without remoteJidAlt:', msg?.id);
+        return;
+      }
 
       // Skip messages with empty content
       const transformed = transformMessage(msg);
@@ -380,6 +685,17 @@ export async function fetchGroupedConversations(
       }
 
       const phone = transformed.whatsapp_number;
+      processedPhones.add(phone);
+
+      // Check if outgoing message is from bot by comparing with n8n_chat_histories
+      if (transformed.message_type === 'outgoing') {
+        const isBotMessage = checkIfBotMessage(
+          transformed.message_content,
+          phone,
+          botMessages
+        );
+        transformed.is_from_bot = isBotMessage;
+      }
 
       if (!messagesMap.has(phone)) {
         messagesMap.set(phone, []);
@@ -392,10 +708,57 @@ export async function fetchGroupedConversations(
       }
     });
 
+    // Fetch messages for conversations that are in Supabase but not in Evolution API
+    const missingPhones = Array.from(allConversationNumbers).filter(
+      phone => !processedPhones.has(phone)
+    );
+
+    console.log(`Found ${missingPhones.length} conversations in Supabase not in Evolution API`);
+
+    // Fetch Supabase messages for missing conversations (in batches)
+    const batchSize = 10;
+    for (let i = 0; i < missingPhones.length; i += batchSize) {
+      const batch = missingPhones.slice(i, i + batchSize);
+      const batchPromises = batch.map(phone => fetchSupabaseMessages(phone));
+      const batchResults = await Promise.all(batchPromises);
+
+      batchResults.forEach((messages, index) => {
+        const phone = batch[index];
+        if (messages.length > 0) {
+          messagesMap.set(phone, messages);
+        }
+      });
+    }
+
+    // Also merge Supabase messages into existing Evolution API conversations
+    // This ensures we have complete message history
+    for (const phone of processedPhones) {
+      const supabaseMessages = await fetchSupabaseMessages(phone);
+      const existingMessages = messagesMap.get(phone) || [];
+
+      // Merge messages, avoiding duplicates
+      supabaseMessages.forEach(sbMsg => {
+        const exists = existingMessages.some(m =>
+          normalizeMessageContent(m.message_content) === normalizeMessageContent(sbMsg.message_content) &&
+          Math.abs(m.timestamp - sbMsg.timestamp) < 60000 // Within 1 minute
+        );
+
+        if (!exists) {
+          existingMessages.push(sbMsg);
+        }
+      });
+
+      // Re-sort after merging
+      existingMessages.sort((a, b) => a.timestamp - b.timestamp);
+      messagesMap.set(phone, existingMessages);
+    }
+
     // Build grouped conversations
     const grouped: GroupedConversation[] = [];
 
     messagesMap.forEach((messages, phone) => {
+      if (messages.length === 0) return;
+
       // Sort messages by timestamp (oldest first)
       messages.sort((a, b) => a.timestamp - b.timestamp);
 
@@ -415,6 +778,8 @@ export async function fetchGroupedConversations(
 
     // Sort by last message time (newest first)
     grouped.sort((a, b) => b.last_message.timestamp - a.last_message.timestamp);
+
+    console.log(`Total conversations: ${grouped.length}`);
 
     return grouped;
   } catch (error) {
