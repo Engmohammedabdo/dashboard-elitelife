@@ -17,7 +17,8 @@ import {
   X,
   MessageCircle,
   Users,
-  Activity
+  Activity,
+  Brain
 } from 'lucide-react';
 
 interface Notification {
@@ -67,13 +68,14 @@ export default function Sidebar({ notificationCount = 0, onNotificationClick }: 
   const isConversationsPage = pathname?.includes('conversations');
   const isPatientsPage = pathname?.includes('patients');
   const isReliabilityPage = pathname?.includes('reliability');
+  const isAIReportPage = pathname?.includes('ai-report');
 
   const menuItems = [
     {
       href: '/',
       icon: LayoutDashboard,
       label: t('dashboard'),
-      active: pathname === '/' || pathname === `/${locale}` || pathname === '' || (!isSettingsPage && !isConversationsPage && !isPatientsPage && !isReliabilityPage)
+      active: pathname === '/' || pathname === `/${locale}` || pathname === '' || (!isSettingsPage && !isConversationsPage && !isPatientsPage && !isReliabilityPage && !isAIReportPage)
     },
     {
       href: '/conversations',
@@ -92,6 +94,12 @@ export default function Sidebar({ notificationCount = 0, onNotificationClick }: 
       icon: Activity,
       label: t('reliability'),
       active: isReliabilityPage
+    },
+    {
+      href: '/ai-report',
+      icon: Brain,
+      label: isRTL ? 'تقرير AI' : 'AI Report',
+      active: isAIReportPage
     },
     {
       href: '/settings?tab=schedule',
